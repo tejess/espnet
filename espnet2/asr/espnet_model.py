@@ -102,6 +102,20 @@ class ESPnetASRModel(AbsESPnetModel):
         self.postencoder = postencoder
         self.encoder = encoder
 
+        try:
+            if self.frontend.frontend_type == "mixed":
+                self.mixed_frontend = True
+                self.frontend_len = self.frontend.frontend_num
+                self.pred_head_num = self.frontend.pred_head_num 
+                self.frontend_loss_func = torch.nn.ModuleList([torch.nn.L1Loss(reduction="mean") 
+                                                            for i in range(self.frontend_len)]).to(self.frontend.dev) 
+                # Should consider to changing this MSE
+                self.feats_linear = torch.nn.ModuleList([torch.nn.Linear(in_features=self.frontend.proj_dim, 
+                        out_features=self.frontend.proj_dim
+                        ) for i in range(self.frontend_len)]).to(self.frontend.dev)
+        except:
+            self.mixed_frontend = False
+
         if not hasattr(self.encoder, "interctc_use_conditioning"):
             self.encoder.interctc_use_conditioning = False
         if self.encoder.interctc_use_conditioning:
@@ -186,6 +200,8 @@ class ESPnetASRModel(AbsESPnetModel):
             self.ctc = None
         else:
             self.ctc = ctc
+
+        self.loss_simult_frontend = 0
 
         self.extract_feats_in_collect_stats = extract_feats_in_collect_stats
 
@@ -347,6 +363,13 @@ class ESPnetASRModel(AbsESPnetModel):
             stats["wer"] = wer_att
 
         # Collect total loss stats
+        if self.mixed_frontend:
+            if self.frontend.fusion: 
+                stats["loss_frontend"] = 0.0
+            else:
+                for i in range(self.frontend_len):
+                    loss += self.loss_simult_frontend[i]
+                    stats["loss_frontend_"+str(i)] = self.loss_simult_frontend[i]
         stats["loss"] = loss.detach()
 
         # force_gatherable: to-device and to-tensor if scalar for DataParallel
@@ -365,7 +388,7 @@ class ESPnetASRModel(AbsESPnetModel):
         return {"feats": feats, "feats_lengths": feats_lengths}
 
     def encode(
-        self, speech: torch.Tensor, speech_lengths: torch.Tensor
+        self, speech: torch.Tensor, speech_lengths: torch.Tensor, effuse_training=True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Frontend + Encoder. Note that this method is used by asr_inference.py
 
@@ -375,7 +398,7 @@ class ESPnetASRModel(AbsESPnetModel):
         """
         with autocast(False):
             # 1. Extract feats
-            feats, feats_lengths = self._extract_feats(speech, speech_lengths)
+            feats, feats_lengths = self._extract_feats(speech, speech_lengths, effuse_training)
 
             # 2. Data augmentation
             if self.specaug is not None and self.training:
@@ -428,9 +451,16 @@ class ESPnetASRModel(AbsESPnetModel):
             return (encoder_out, intermediate_outs), encoder_out_lens
 
         return encoder_out, encoder_out_lens
+    def _calc_frontend_loss(
+        self, split_feats : list, pred_feats : list
+    ):
+        # this loss method calculates the difference of minimmized features (in the original dimensions)
+        feat_loss = [self.frontend_loss_func[i](pred_feats[i], split_feats[i]) for i in range(self.frontend_len)]
+        return feat_loss
+
 
     def _extract_feats(
-        self, speech: torch.Tensor, speech_lengths: torch.Tensor
+        self, speech: torch.Tensor, speech_lengths: torch.Tensor, effuse_training
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert speech_lengths.dim() == 1, speech_lengths.shape
 
@@ -442,7 +472,26 @@ class ESPnetASRModel(AbsESPnetModel):
             #  e.g. STFT and Feature extract
             #       data_loader may send time-domain signal in this case
             # speech (Batch, NSamples) -> feats: (Batch, NFrames, Dim)
-            feats, feats_lengths = self.frontend(speech, speech_lengths)
+            if self.mixed_frontend:
+                # Mixed frontend is for EFFUSE training
+                feats, feats_lengths =  self.frontend(speech, speech_lengths, effuse_training)
+                if not self.frontend.fusion: 
+                    # assume that the first frontend representation is the prediction head
+                    split_feats = list(torch.split(feats, self.frontend.proj_dim, dim=-1))
+                    split_feats = [split_feats[i].to(feats.device) for i in range(len(split_feats))]
+                    if effuse_training:
+                        pred_feats = [self.feats_linear[i](split_feats[self.pred_head_num]) for i in range(self.frontend_len)]
+                        pred_feats[self.pred_head_num] = split_feats[self.pred_head_num]
+                        self.loss_simult_frontend = self._calc_frontend_loss(split_feats, pred_feats)
+                    else:
+                        pred_feats = [self.feats_linear[i](feats) for i in range(self.frontend_len)]
+                        
+                        pred_feats[self.pred_head_num] = feats
+
+                    feats = torch.cat(pred_feats, dim=-1)
+            else: 
+                # Default Case of frontend
+                feats, feats_lengths = self.frontend(speech, speech_lengths)
         else:
             # No frontend and no feature extract
             feats, feats_lengths = speech, speech_lengths
