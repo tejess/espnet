@@ -101,7 +101,7 @@ class ESPnetASRModel(AbsESPnetModel):
         self.preencoder = preencoder
         self.postencoder = postencoder
         self.encoder = encoder
-
+        self.mixed_frontend = False
         try:
             if self.frontend.frontend_type == "mixed":
                 self.mixed_frontend = True
@@ -114,7 +114,7 @@ class ESPnetASRModel(AbsESPnetModel):
                         out_features=self.frontend.proj_dim
                         ) for i in range(self.frontend_len)]).to(self.frontend.dev)
         except:
-            self.mixed_frontend = False
+            pass
 
         if not hasattr(self.encoder, "interctc_use_conditioning"):
             self.encoder.interctc_use_conditioning = False
