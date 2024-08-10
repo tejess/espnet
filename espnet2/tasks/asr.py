@@ -130,6 +130,15 @@ model_choices = ClassChoices(
     type_check=AbsESPnetModel,
     default="espnet",
 )
+discrete_unit_predictor_choices = ClassChoices(
+    name="discrete_unit_predictor",
+    classes=dict(
+        transformer=TransformerEncoder,
+    ),
+    type_check=AbsEncoder,
+    default=None,
+    optional=True,
+)
 preencoder_choices = ClassChoices(
     name="preencoder",
     classes=dict(
@@ -227,6 +236,7 @@ class ASRTask(AbsTask):
         decoder_choices,
         # --preprocessor and --preprocessor_conf
         preprocessor_choices,
+        discrete_unit_predictor_choices,
     ]
 
     # If you need to modify train() or eval() procedures, change Trainer class here
@@ -491,6 +501,8 @@ class ASRTask(AbsTask):
 
         retval = ["text_spk{}".format(n) for n in range(2, MAX_REFERENCE_NUM + 1)]
         retval = retval + ["prompt"]
+        if not inference:
+            retval = retval + ["discrete_speech", "src_text_shape"]
         retval = tuple(retval)
 
         logging.info(f"Optional Data Names: {retval }")
@@ -550,7 +562,17 @@ class ASRTask(AbsTask):
             normalize = normalize_class(**args.normalize_conf)
         else:
             normalize = None
-
+        
+        if getattr(args, "discrete_unit_predictor", None) is not None:
+            discrete_unit_predictor_class = discrete_unit_predictor_choices.get_class(args.discrete_unit_predictor)
+            if args.discrete_unit_predictor_conf['discrete_unit_predictor_training'] == 1:
+                discrete_unit_predictor = discrete_unit_predictor_class(**args.discrete_unit_predictor_conf)
+            else:
+                discrete_unit_predictor = discrete_unit_predictor_class(input_size=input_size, **args.discrete_unit_predictor_conf)
+                input_size = discrete_unit_predictor.output_size()
+        else:
+            discrete_unit_predictor = None
+            
         # 4. Pre-encoder input block
         # NOTE(kan-bayashi): Use getattr to keep the compatibility
         if getattr(args, "preencoder", None) is not None:
@@ -620,6 +642,7 @@ class ASRTask(AbsTask):
             specaug=specaug,
             normalize=normalize,
             preencoder=preencoder,
+            discrete_unit_predictor=discrete_unit_predictor,
             encoder=encoder,
             postencoder=postencoder,
             decoder=decoder,

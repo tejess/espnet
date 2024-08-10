@@ -33,7 +33,7 @@ from espnet.nets.pytorch_backend.transformer.subsampling import (
     TooShortUttError,
     check_short_utt,
 )
-
+import logging
 
 class TransformerEncoder(AbsEncoder):
     """Transformer encoder module.
@@ -80,6 +80,7 @@ class TransformerEncoder(AbsEncoder):
         interctc_layer_idx: List[int] = [],
         interctc_use_conditioning: bool = False,
         layer_drop_rate: float = 0.0,
+        discrete_unit_predictor_training: Optional[int] = 1,
     ):
         assert check_argument_types()
         super().__init__()
@@ -170,6 +171,7 @@ class TransformerEncoder(AbsEncoder):
             assert 0 < min(interctc_layer_idx) and max(interctc_layer_idx) < num_blocks
         self.interctc_use_conditioning = interctc_use_conditioning
         self.conditioning_layer = None
+        self.discrete_unit_predictor_training = discrete_unit_predictor_training
 
     def output_size(self) -> int:
         return self._output_size
@@ -217,6 +219,8 @@ class TransformerEncoder(AbsEncoder):
             xs_pad, masks = self.embed(xs_pad, masks)
         else:
             xs_pad = self.embed(xs_pad)
+        
+        logging.info(f"xs_pad shape: {xs_pad.shape}")
 
         intermediate_outs = []
         if len(self.interctc_layer_idx) == 0:

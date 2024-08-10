@@ -133,9 +133,22 @@ class MixedFusedFrontends(AbsFrontend):
         self.projection_layers = torch.nn.ModuleList(self.projection_layers)
         self.projection_layers = self.projection_layers.to(torch.device(dev))
         self.frontend_type = "mixed"
+        self.output_size_val = 0
+        self.output_split_ls = []
+        for align, frontend in zip(self.align_method, self.frontends):
+            if align == "none":
+                self.output_size_val += frontend.output_size()
+                self.output_split_ls.append(frontend.output_size())
+            else:
+                self.output_size_val += self.proj_dim
+                self.output_split_ls.append(self.proj_dim)
 
     def output_size(self) -> int:
-        return len(self.frontends) * self.proj_dim
+        return self.output_size_val
+
+    def output_split(self) -> int:
+        return self.output_split_ls
+
 
     def forward(
         self, input: torch.Tensor, input_lengths: torch.Tensor, training=True
@@ -206,8 +219,9 @@ class MixedFusedFrontends(AbsFrontend):
                         input_feats_proj, (bs, nf * self.factors[i], dim // self.factors[i])
                     )
                     self.feats_reshaped.append(input_feats_reshaped)
-                    
-
+                
+                elif align == "none":
+                    self.feats_reshaped.append(self.feats[i][0])
                 else:
                     raise NotImplementedError
 
@@ -228,6 +242,6 @@ class MixedFusedFrontends(AbsFrontend):
             # 4th step : concatenate all of the features
             input_feats = torch.cat(
                 self.feats_final, dim=-1
-            )  # change the input size of the preencoder : proj_dim * n_frontends
+            )
             feats_lens = torch.ones_like(self.feats[0][1]) * (m)
         return input_feats, feats_lens

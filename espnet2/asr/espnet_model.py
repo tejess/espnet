@@ -1,6 +1,6 @@
 import logging
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import torch
 from packaging.version import parse as V
@@ -24,6 +24,7 @@ from espnet.nets.pytorch_backend.transformer.add_sos_eos import add_sos_eos
 from espnet.nets.pytorch_backend.transformer.label_smoothing_loss import (  # noqa: H301
     LabelSmoothingLoss,
 )
+from espnet2.asr.straight_through import OneHotArgmaxSTE, DiscreteSTE
 
 if V(torch.__version__) >= V("1.6.0"):
     from torch.cuda.amp import autocast
@@ -45,6 +46,7 @@ class ESPnetASRModel(AbsESPnetModel):
         specaug: Optional[AbsSpecAug],
         normalize: Optional[AbsNormalize],
         preencoder: Optional[AbsPreEncoder],
+        discrete_unit_predictor: Optional[AbsEncoder],
         encoder: AbsEncoder,
         postencoder: Optional[AbsPostEncoder],
         decoder: Optional[AbsDecoder],
@@ -90,6 +92,7 @@ class ESPnetASRModel(AbsESPnetModel):
             self.eos = vocab_size - 1
         self.vocab_size = vocab_size
         self.ignore_id = ignore_id
+        logging.info(self.ignore_id)
         self.ctc_weight = ctc_weight
         self.interctc_weight = interctc_weight
         self.aux_ctc = aux_ctc
@@ -99,9 +102,26 @@ class ESPnetASRModel(AbsESPnetModel):
         self.specaug = specaug
         self.normalize = normalize
         self.preencoder = preencoder
+        self.discrete_unit_predictor = discrete_unit_predictor
         self.postencoder = postencoder
         self.encoder = encoder
         self.mixed_frontend = False
+
+        self.index = 0
+        self.size = 0
+
+        if self.discrete_unit_predictor is not None:
+            self.discrete_loss_func = torch.nn.CrossEntropyLoss()
+            self.transformer_loss_func = torch.nn.CrossEntropyLoss()
+            self.pred_ssl_loss = torch.nn.MSELoss()
+            self.gumbel_softmax = torch.nn.functional.gumbel_softmax
+            self.tau = torch.nn.Parameter(torch.tensor(0.1))
+            self.discrete_loss = 0
+            self.transformer_loss = 0
+            self.ssl_loss = 0
+            self.train_stage = self.discrete_unit_predictor.discrete_unit_predictor_training
+            
+
         try:
             if self.frontend.frontend_type == "mixed":
                 self.mixed_frontend = True
@@ -245,12 +265,12 @@ class ESPnetASRModel(AbsESPnetModel):
         batch_size = speech.shape[0]
 
         text[text == -1] = self.ignore_id
+        logging.info(speech.shape)
 
         # for data-parallel
         text = text[:, : text_lengths.max()]
-
         # 1. Encoder
-        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths, **kwargs)
         intermediate_outs = None
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
@@ -268,6 +288,9 @@ class ESPnetASRModel(AbsESPnetModel):
             )
 
             # Collect CTC branch stats
+            if self.discrete_unit_predictor is not None and self.train_stage == 2:
+                loss_ctc = None
+                cer_ctc = None
             stats["loss_ctc"] = loss_ctc.detach() if loss_ctc is not None else None
             stats["cer_ctc"] = cer_ctc
 
@@ -352,7 +375,7 @@ class ESPnetASRModel(AbsESPnetModel):
             if self.ctc_weight == 0.0:
                 loss = loss_att
             elif self.ctc_weight == 1.0:
-                loss = loss_ctc
+                loss = loss_ctc if loss_ctc is not None else 0.0
             else:
                 loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att
 
@@ -363,6 +386,14 @@ class ESPnetASRModel(AbsESPnetModel):
             stats["wer"] = wer_att
 
         # Collect total loss stats
+        if self.discrete_unit_predictor is not None:
+            stats["discrete_loss"] = self.discrete_loss
+            stats["transformer_loss"] = self.transformer_loss
+            stats["ssl_loss"] = self.ssl_loss
+            loss += self.discrete_loss
+            loss += self.transformer_loss
+            loss += self.ssl_loss
+
         if self.mixed_frontend:
             if self.frontend.fusion: 
                 stats["loss_frontend"] = 0.0
@@ -388,7 +419,7 @@ class ESPnetASRModel(AbsESPnetModel):
         return {"feats": feats, "feats_lengths": feats_lengths}
 
     def encode(
-        self, speech: torch.Tensor, speech_lengths: torch.Tensor, effuse_training=True
+        self, speech: torch.Tensor, speech_lengths: torch.Tensor, effuse_training=True, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Frontend + Encoder. Note that this method is used by asr_inference.py
 
@@ -396,22 +427,51 @@ class ESPnetASRModel(AbsESPnetModel):
             speech: (Batch, Length, ...)
             speech_lengths: (Batch, )
         """
+        logging.info(f"Speech shape: {speech.shape}")
         with autocast(False):
             # 1. Extract feats
             feats, feats_lengths = self._extract_feats(speech, speech_lengths, effuse_training)
-
             # 2. Data augmentation
             if self.specaug is not None and self.training:
                 feats, feats_lengths = self.specaug(feats, feats_lengths)
-
             # 3. Normalization for feature: e.g. Global-CMVN, Utterance-CMVN
             if self.normalize is not None:
                 feats, feats_lengths = self.normalize(feats, feats_lengths)
+        
+        # Predict discrete_speech with another encoder
+        # kwargs should contain the discrete_speech
+        if self.discrete_unit_predictor is not None:
+            if self.train_stage == 1:
+                split = self.frontend.output_split()
+                split_feats = torch.split(feats, split, dim=-1)
+                pred_feats, pred_feats_lengths, _ = self.discrete_unit_predictor(split_feats[1], feats_lengths)
+                self.ssl_loss = self.pred_ssl_loss(pred_feats, split_feats[0])
+            else:
+                feats, feats_lengths, _ = self.discrete_unit_predictor(feats, feats_lengths)
 
         # Pre-encoder, e.g. used for raw input data
         if self.preencoder is not None:
             feats, feats_lengths = self.preencoder(feats, feats_lengths)
+        
+        if self.discrete_unit_predictor is not None:
+            if self.train_stage != 1:
+                discrete_speech_feats = kwargs.get('discrete_speech')
+                discrete_speech_feats_length = kwargs.get('discrete_speech_lengths')
+                # (B, F, C) -> (B*F, C) T: (B*F)
+                if feats.shape[1] != discrete_speech_feats.shape[-1]:
+                    feats = feats[:, :discrete_speech_feats.shape[-1], :]
+                    feats_lengths = discrete_speech_feats_length
+                if self.train_stage == 2:
+                    self.transformer_loss = self.discrete_pred_loss(feats, discrete_speech_feats, self.transformer_loss_func)
+                elif self.train_stage == 3:
+                    self.transformer_loss = self.discrete_pred_loss(feats, discrete_speech_feats, self.transformer_loss_func)
+                    # feats = DiscreteSTE.apply(feats)
+                    # logging.info(discrete_speech_feats_length)
+                    # logging.info(feats_lengths)
+                    feats = self.gumbel_softmax(feats, tau=self.tau, hard=True)
+                    self.discrete_loss = self.discrete_pred_loss(feats, discrete_speech_feats, self.discrete_loss_func)
 
+        
         # 4. Forward encoder
         # feats: (Batch, Length, Dim)
         # -> encoder_out: (Batch, Length2, Dim2)
@@ -451,16 +511,23 @@ class ESPnetASRModel(AbsESPnetModel):
             return (encoder_out, intermediate_outs), encoder_out_lens
 
         return encoder_out, encoder_out_lens
-    def _calc_frontend_loss(
-        self, split_feats : list, pred_feats : list
-    ):
+    
+    def _calc_frontend_loss(self, split_feats : list, pred_feats : list) -> list:
         # this loss method calculates the difference of minimmized features (in the original dimensions)
         feat_loss = [self.frontend_loss_func[i](pred_feats[i], split_feats[i]) for i in range(self.frontend_len)]
         return feat_loss
+    
+
+    
+    def discrete_pred_loss(self, feats: torch.Tensor, discrete_speech_feats: torch.Tensor, loss_func : Callable) -> torch.Tensor:
+        mask = discrete_speech_feats.unsqueeze(-1) != self.ignore_id
+        discrete_mask = mask.squeeze(-1)
+        loss = loss_func(feats.masked_select(mask).view(-1, feats.size(-1)), discrete_speech_feats.masked_select(discrete_mask).view(-1))
+        return loss
 
 
     def _extract_feats(
-        self, speech: torch.Tensor, speech_lengths: torch.Tensor, effuse_training
+        self, speech: torch.Tensor, speech_lengths: torch.Tensor, effuse_training=True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert speech_lengths.dim() == 1, speech_lengths.shape
 
@@ -490,11 +557,22 @@ class ESPnetASRModel(AbsESPnetModel):
 
                     feats = torch.cat(pred_feats, dim=-1)
             else: 
-                # Default Case of frontend
+                # General Case of frontend
                 feats, feats_lengths = self.frontend(speech, speech_lengths)
+                '''
+                from pathlib import Path
+                path = Path(f"/ocean/projects/cis210027p/tsrivast/espnet/egs2/totonac_1/asr1/feats/mfcc_{self.index}.pt")
+                logging.info(f"Saving to file espnet/egs2/totonac_1/asr1/feats/mfcc_{self.index}.pt")
+                self.size += feats.shape[1]
+                self.index += 1
+                torch.save(feats, path)
+                if self.size >= 5000:
+                    raise NameError
+                '''
         else:
             # No frontend and no feature extract
             feats, feats_lengths = speech, speech_lengths
+            logging.info(f"Speech shape not changing: {speech.shape}")
         return feats, feats_lengths
 
     def nll(
